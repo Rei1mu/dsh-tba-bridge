@@ -49,6 +49,23 @@ function makeUserMessage(text) {
 
 const WAKE_INTERVAL_MS = 2000
 
+// 抽风循环判定阈值。用户口径「抽风两三次就截断」：
+// REPEAT_THRESHOLD 次相同调用算「一次抽风」，攒够 TRIP_LIMIT 次就 cancel。
+// 调小更容易断（阈值 1 = 一出现重复立刻断），调大更宽容。
+const REPEAT_THRESHOLD = 3
+const TRIP_LIMIT = 2
+
+// 参数序列化前做深 key 排序：同一个调用换参数书写顺序也算同一次。
+function canonicalize(value) {
+  if (Array.isArray(value)) return value.map(canonicalize)
+  if (value && typeof value === 'object') {
+    const out = {}
+    for (const k of Object.keys(value).sort()) out[k] = canonicalize(value[k])
+    return out
+  }
+  return value
+}
+
 export const name = 'dsh-tba-bridge'
 export const inject = ['agents', 'timer']
 
@@ -101,14 +118,26 @@ export function apply(ctx, config = {}) {
       const text = typeof payload?.text === 'string' ? payload.text : ''
       if (!sessionId) { try { rmSync(full, { force: true }) } catch {} continue }
 
-      const agent = agents.get?.(sessionId)
+      let agent = agents.get?.(sessionId)
+      let fallback = false
       if (!agent) {
-        // 目标会话不在本进程（可能已归档/别处）：留着文件，不删，等会话回来。
-        diag({ phase: 'agent-missing', sessionId })
-        continue
+        // 目标会话已不在本进程：最常见是子代理干完被回收（ask 由它发出，
+        // wake 写的就是它的 sessionId）。此时回退投给当前活跃主会话（root），
+        // 别把回复丢在文件里没人处理。root = origin 非 subagent 的会话。
+        const roots = (agents.list?.() ?? [])
+          .filter((a) => a && a.session?.header?.origin !== 'subagent')
+        agent = roots[0]
+        fallback = roots.length > 0
+        if (!agent) {
+          // 一个活跃会话都没有：留着文件，等会话回来。
+          diag({ phase: 'agent-missing', sessionId })
+          continue
+        }
+        diag({ phase: 'fallback-root', sessionId, targetId: agent.id })
       }
       try {
-        const msg = makeUserMessage(text)
+        const msgText = fallback ? `[tba 回复投递：原会话 ${sessionId} 已回收]\n${text}` : text
+        const msg = makeUserMessage(msgText)
         // 插队执行，不排队下一轮。
         // send(..., 'next-turn', true) = followup 语义：排到「下一轮」，当前轮结束才执行，
         // 实测表现为「消息进队列但不发送」。改用 steer = send(msg, 'next-step', true)：
@@ -119,8 +148,8 @@ export function apply(ctx, config = {}) {
         } else {
           agent.send(msg, 'next-step', true)
         }
-        logger.info?.(`dsh-tba-bridge: 已插队唤醒会话 ${sessionId}`)
-        diag({ phase: 'injected', mode: 'steer', sessionId })
+        logger.info?.(`dsh-tba-bridge: 已插队唤醒会话 ${agent.id}${fallback ? '（回退主会话）' : ''}`)
+        diag({ phase: 'injected', mode: fallback ? 'fallback-root' : 'steer', sessionId, targetId: agent.id })
       } catch (e) {
         logger.warn?.(`dsh-tba-bridge: 注入会话 ${sessionId} 失败: ${e?.message ?? e}`)
         diag({ phase: 'inject-error', sessionId, error: String(e?.message ?? e) })
@@ -128,6 +157,84 @@ export function apply(ctx, config = {}) {
       try { rmSync(full, { force: true }) } catch {}
     }
   }
+
+  // ── 抽风循环截断 ────────────────────────────────────────────────
+  // 子代理死磕同一个工具调用是常见的「抽风」：模型卡在同一个动作上反复重试。
+  // tools/post-execute 是 waterfall，denied 的调用也会流经这里（模型反复撞一个
+  // 被拒的调用正是要断的循环），所以在这里数「同一个 name + 同一份 arguments」
+  // 连续出现多少次。
+  //
+  // 只管子代理：主代理重复调用常常是有意的多轮排查，误杀代价大。
+  // origin === 'subagent' 是官方口径（dsh-session types.ts），delegationDepth 兜底。
+  const chains = new WeakMap() // Agent -> { key, count }
+  const trips = new WeakMap() // Agent -> number（累计抽风次数）
+
+  const isSubagent = (a) =>
+    a?.session?.header?.origin === 'subagent' ||
+    (a?.session?.header?.delegationDepth ?? 0) > 0
+
+  // agent.cancel(cause, { keepInbox }) 是官方给插件的截断口子（dsh-session types.ts）。
+  // keepInbox: true 必须显式传：默认 false 会 inbox.clear() 丢掉还没跑的 user 消息。
+  // idle 时 cancel 是 no-op，不会 throw。
+  const truncate = (agent, detail, meta) => {
+    const reason = `tba-bridge/loop-truncated: ${detail}`
+    try {
+      agent.cancel?.({ kind: 'hook', reason }, { keepInbox: true })
+      logger.warn?.(`dsh-tba-bridge: 截断抽风子代理 ${agent?.id ?? '?'}（${detail}）`)
+    } catch (e) {
+      logger.warn?.(`dsh-tba-bridge: 截断子代理 ${agent?.id ?? '?'} 失败: ${e?.message ?? e}`)
+    }
+    diag({ phase: 'loop-truncated', agentId: agent?.id, ...meta })
+    chains.delete(agent)
+    trips.delete(agent)
+  }
+
+  // 永不阻断下游：先把结果放行，再做事后统计。
+  ctx.on('tools/post-execute', async (exec, result, next) => {
+    const downstream = await next()
+    try {
+      const agent = exec?.agent
+      if (agent && isSubagent(agent)) {
+        const key = JSON.stringify([exec.name, canonicalize(exec.arguments)])
+        const prev = chains.get(agent)
+        const count = prev && prev.key === key ? prev.count + 1 : 1
+        chains.set(agent, { key, count })
+        if (count >= REPEAT_THRESHOLD) {
+          const trip = (trips.get(agent) ?? 0) + 1
+          trips.set(agent, trip)
+          chains.delete(agent) // 同一个 key 不重复计同一次抽风
+          if (trip >= TRIP_LIMIT) {
+            truncate(agent, `${exec.name} 连续重复 ${count} 次，第 ${trip} 次抽风`, {
+              tool: exec.name,
+              count,
+              trip,
+            })
+          } else {
+            logger.warn?.(
+              `dsh-tba-bridge: 子代理 ${agent.id ?? '?'} 抽风（${exec.name} 重复 ${count} 次），第 ${trip}/${TRIP_LIMIT} 次`,
+            )
+            diag({ phase: 'loop-detected', agentId: agent.id, tool: exec.name, count, trip })
+          }
+        }
+      }
+    } catch {}
+    return downstream
+  })
+
+  // 用户插话即重置：人已经介入，交给模型重新判断，别拿旧账继续累积。
+  ctx.on('agent/pre-step', ({ agent, messages }, next) => {
+    if (messages?.some((m) => m.source?.kind === 'user')) {
+      chains.delete(agent)
+      trips.delete(agent)
+    }
+    return next()
+  })
+
+  // WeakMap 本身会随 Agent 回收，显式删只是让语义明确。
+  ctx.on('agent/disposed', ({ agent }) => {
+    chains.delete(agent)
+    trips.delete(agent)
+  })
 
   // 用 cordis 的 ctx.interval：定时器注册到当前 fiber，随插件 dispose 自动清理，
   // 不会像裸 setInterval 那样在 fiber  quiesce 后被吞掉。
