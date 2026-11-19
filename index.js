@@ -63,7 +63,9 @@ async function deliver(agents, subagents, sessionId, text, diag) {
   if (!subagents) { diag({ phase: 'no-subagents-service', sessionId }); return false }
   const roots = (agents.list?.() ?? [])
     .filter((a) => a && a.session?.header?.origin !== 'subagent')
-  diag({ phase: 'deliver-scan', sessionId, roots: roots.map((r) => r.id) })
+  diag({ phase: 'deliver-scan', sessionId,
+    allAgents: (agents.list?.() ?? []).map((a) => ({ id: a.id, origin: a.session?.header?.origin })),
+    roots: roots.map((r) => r.id) })
   const ac = new AbortController()
   for (const root of roots) {
     try {
