@@ -116,6 +116,7 @@ export function apply(ctx, config = {}) {
       }
       const sessionId = payload?.sessionId
       const text = typeof payload?.text === 'string' ? payload.text : ''
+      const claimId = typeof payload?.claimId === 'string' ? payload.claimId : ''
       if (!sessionId) { try { rmSync(full, { force: true }) } catch {} continue }
 
       let agent = agents.get?.(sessionId)
@@ -133,10 +134,15 @@ export function apply(ctx, config = {}) {
           diag({ phase: 'agent-missing', sessionId })
           continue
         }
-        diag({ phase: 'fallback-root', sessionId, targetId: agent.id })
+        diag({ phase: 'fallback-root', sessionId, claimId, targetId: agent.id })
       }
       try {
-        const msgText = fallback ? `[tba 回复投递：原会话 ${sessionId} 已回收]\n${text}` : text
+        // 原会话已回收时，注入主会话的消息必须带 claimId 和明确接管指令，
+        // 否则主会话收到一句「原会话已回收」不知道要干嘛，回复就悬空了。
+        // 主会话按 AGENTS.md 流程 tba reply <claim> + tba events 读回 + 判断分派。
+        const msgText = fallback
+          ? `[tba 回复投递：原会话 ${sessionId} 已回收，该任务子代理已结束]\n用户回复：${text}\n${claimId ? `任务 claim：${claimId}\n` : ''}请按 tba 流程接管：tba reply ${claimId} 把任务推回进行中 → tba events --claim ${claimId} --full 读回原话 → 判断是继续原子代理还是新派任务。`
+          : text
         const msg = makeUserMessage(msgText)
         // 插队执行，不排队下一轮。
         // send(..., 'next-turn', true) = followup 语义：排到「下一轮」，当前轮结束才执行，
