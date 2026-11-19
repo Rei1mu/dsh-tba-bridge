@@ -17,7 +17,7 @@
  * @module index.js
  */
 
-import { readdirSync, readFileSync, rmSync, mkdirSync, writeFileSync } from 'node:fs'
+import { readdirSync, readFileSync, rmSync, mkdirSync, writeFileSync, appendFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { randomUUID } from 'node:crypto'
@@ -118,14 +118,12 @@ export function apply(ctx, config = {}) {
   let stop = false
   // 诊断：只在启动 / 注入 / 出问题时落盘，空轮询不产生 IO。
   const diagPath = join(dir, '_bridge-status.json')
+  const diagLogPath = join(dir, '_bridge-debug.jsonl')
   const diag = (extra) => {
     try {
-      writeFileSync(diagPath, JSON.stringify({
-        at: new Date().toISOString(),
-        dir,
-        ctxHasAgents: !!ctx.agents,
-        ...extra,
-      }, null, 2))
+      const row = { at: new Date().toISOString(), dir, ctxHasAgents: !!ctx.agents, ...extra }
+      writeFileSync(diagPath, JSON.stringify(row, null, 2))
+      appendFileSync(diagLogPath, JSON.stringify(row) + '\n')
     } catch {}
   }
   diag({ phase: 'started' })
