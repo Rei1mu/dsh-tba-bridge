@@ -47,6 +47,43 @@ function makeUserMessage(text) {
   }
 }
 
+// 把回复投给目标会话。目标子代理 settle 后会从 agents 注册表注销，但 Session
+// 持久、仍在 subagentCatalog 里——此时 agents.get 找不到，需走 subagents.sendMessage
+// 冷恢复（它会重建 subagent 树归属，比 agents.resume 干净）。sender 用持有该目标的
+// 活 root。返回 true=已投；false=都失败，调用方走 fallback 兜底。
+async function deliver(agents, subagents, sessionId, text, diag) {
+  const live = agents.get?.(sessionId)
+  if (live) {
+    const msg = makeUserMessage(text)
+    if (typeof live.steer === 'function') live.steer(msg)
+    else live.send(msg, 'next-step', true)
+    diag({ phase: 'steer', sessionId, targetId: live.id })
+    return true
+  }
+  if (!subagents) return false
+  const roots = (agents.list?.() ?? [])
+    .filter((a) => a && a.session?.header?.origin !== 'subagent')
+  const ac = new AbortController()
+  for (const root of roots) {
+    try {
+      const descendants = await subagents.listDescendants(root.id, ac.signal)
+      const hit = (descendants ?? []).some((d) => d && d.id === sessionId)
+      if (!hit) continue
+      await subagents.sendMessage(
+        root,
+        sessionId,
+        [{ type: 'text', text }],
+        { signal: ac.signal },
+      )
+      diag({ phase: 'cold-resume', sessionId, rootId: root.id })
+      return true
+    } catch (e) {
+      diag({ phase: 'cold-resume-error', sessionId, rootId: root.id, error: String(e?.message ?? e) })
+    }
+  }
+  return false
+}
+
 const WAKE_INTERVAL_MS = 2000
 
 // 抽风循环判定阈值。用户口径「抽风两三次就截断」：
@@ -67,7 +104,7 @@ function canonicalize(value) {
 }
 
 export const name = 'dsh-tba-bridge'
-export const inject = ['agents', 'timer']
+export const inject = ['agents', 'subagents', 'timer']
 
 export function apply(ctx, config = {}) {
   const logger = ctx.logger ?? console
@@ -119,45 +156,36 @@ export function apply(ctx, config = {}) {
       const claimId = typeof payload?.claimId === 'string' ? payload.claimId : ''
       if (!sessionId) { try { rmSync(full, { force: true }) } catch {} continue }
 
-      let agent = agents.get?.(sessionId)
-      let fallback = false
-      if (!agent) {
-        // 目标会话已不在本进程：最常见是子代理干完被回收（ask 由它发出，
-        // wake 写的就是它的 sessionId）。此时回退投给当前活跃主会话（root），
-        // 别把回复丢在文件里没人处理。root = origin 非 subagent 的会话。
-        const roots = (agents.list?.() ?? [])
-          .filter((a) => a && a.session?.header?.origin !== 'subagent')
-        agent = roots[0]
-        fallback = roots.length > 0
-        if (!agent) {
-          // 一个活跃会话都没有：留着文件，等会话回来。
-          diag({ phase: 'agent-missing', sessionId })
-          continue
-        }
-        diag({ phase: 'fallback-root', sessionId, claimId, targetId: agent.id })
+      // 优先把回复送回目标会话：在线则 steer，已回收的子代理则经 subagents
+      // 冷恢复（保留 subagent 树归属）。这样不同项目各自的子代理都能收到自己的回复，
+      // 不会串到别的会话。只有两条路都失败才 fallback 给某个主会话。
+      const subagents = ctx.subagents ?? ctx.get?.('subagents')
+      let done = false
+      try { done = await deliver(agents, subagents, sessionId, text, diag) } catch (e) {
+        diag({ phase: 'deliver-error', sessionId, error: String(e?.message ?? e) })
       }
+      if (done) { try { rmSync(full, { force: true }) } catch {}; continue }
+
+      // fallback：目标不在、也无法冷恢复（如整个项目会话都关了）。投给一个活跃
+      // 主会话，带 claimId + 明确接管指令——只当兜底，不假装原任务被正确唤醒。
+      const roots = (agents.list?.() ?? [])
+        .filter((a) => a && a.session?.header?.origin !== 'subagent')
+      const agent = roots[0]
+      if (!agent) {
+        // 一个活跃会话都没有：留着文件，等会话回来。
+        diag({ phase: 'agent-missing', sessionId })
+        continue
+      }
+      diag({ phase: 'fallback-root', sessionId, claimId, targetId: agent.id })
       try {
-        // 原会话已回收时，注入主会话的消息必须带 claimId 和明确接管指令，
-        // 否则主会话收到一句「原会话已回收」不知道要干嘛，回复就悬空了。
-        // 主会话按 AGENTS.md 流程 tba reply <claim> + tba events 读回 + 判断分派。
-        const msgText = fallback
-          ? `[tba 回复投递：原会话 ${sessionId} 已回收，该任务子代理已结束]\n用户回复：${text}\n${claimId ? `任务 claim：${claimId}\n` : ''}请按 tba 流程接管：tba reply ${claimId} 把任务推回进行中 → tba events --claim ${claimId} --full 读回原话 → 判断是继续原子代理还是新派任务。`
-          : text
+        const msgText = `[tba 回复投递：原会话 ${sessionId} 已回收且无法冷恢复]\n用户回复：${text}\n${claimId ? `任务 claim：${claimId}\n` : ''}请按 tba 流程接管：tba reply ${claimId} 把任务推回进行中 → tba events --claim ${claimId} --full 读回原话 → 判断是继续原子代理还是新派任务。`
         const msg = makeUserMessage(msgText)
-        // 插队执行，不排队下一轮。
-        // send(..., 'next-turn', true) = followup 语义：排到「下一轮」，当前轮结束才执行，
-        // 实测表现为「消息进队列但不发送」。改用 steer = send(msg, 'next-step', true)：
-        // 插到当前轮的步骤队列，wakeup=true 立刻唤醒 driver，步骤间即被消费。
-        // 老版本 agent 没 steer 时回退到 send('next-step', true)，语义等价。
-        if (typeof agent.steer === 'function') {
-          agent.steer(msg)
-        } else {
-          agent.send(msg, 'next-step', true)
-        }
-        logger.info?.(`dsh-tba-bridge: 已插队唤醒会话 ${agent.id}${fallback ? '（回退主会话）' : ''}`)
-        diag({ phase: 'injected', mode: fallback ? 'fallback-root' : 'steer', sessionId, targetId: agent.id })
+        if (typeof agent.steer === 'function') agent.steer(msg)
+        else agent.send(msg, 'next-step', true)
+        logger.info?.(`dsh-tba-bridge: 回退唤醒主会话 ${agent.id}（原会话 ${sessionId} 无法冷恢复）`)
+        diag({ phase: 'injected', mode: 'fallback-root', sessionId, targetId: agent.id })
       } catch (e) {
-        logger.warn?.(`dsh-tba-bridge: 注入会话 ${sessionId} 失败: ${e?.message ?? e}`)
+        logger.warn?.(`dsh-tba-bridge: 回退注入会话 ${sessionId} 失败: ${e?.message ?? e}`)
         diag({ phase: 'inject-error', sessionId, error: String(e?.message ?? e) })
       }
       try { rmSync(full, { force: true }) } catch {}
