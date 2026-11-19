@@ -60,14 +60,18 @@ async function deliver(agents, subagents, sessionId, text, diag) {
     diag({ phase: 'steer', sessionId, targetId: live.id })
     return true
   }
-  if (!subagents) return false
+  if (!subagents) { diag({ phase: 'no-subagents-service', sessionId }); return false }
   const roots = (agents.list?.() ?? [])
     .filter((a) => a && a.session?.header?.origin !== 'subagent')
+  diag({ phase: 'deliver-scan', sessionId, roots: roots.map((r) => r.id) })
   const ac = new AbortController()
   for (const root of roots) {
     try {
       const descendants = await subagents.listDescendants(root.id, ac.signal)
-      const hit = (descendants ?? []).some((d) => d && d.id === sessionId)
+      // 子代理条目字段是 childId（persistence-catalog），老代码用 d.id 永远匹配不上。
+      // 兼容 id/sessionId/childId 三种写法。
+      const hit = (descendants ?? []).some((d) => d && (d.childId ?? d.id ?? d.sessionId) === sessionId)
+      diag({ phase: 'cold-resume-scan', sessionId, rootId: root.id, descendants: (descendants ?? []).map((d) => d.childId ?? d.id ?? d.sessionId) })
       if (!hit) continue
       await subagents.sendMessage(
         root,
